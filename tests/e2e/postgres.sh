@@ -17,6 +17,9 @@ RUN=$(date -u +%H%M%S)
 reset() {
   point_app_at legacy-pg.legacy.svc.cluster.local
   unfreeze_writes legacy
+  # An interrupted earlier run can leave legacy with rows replicated back
+  # but sequences never copied; start from consistent sequences.
+  legacy_sql "SELECT setval('orders_id_seq', (SELECT max(id) FROM orders))" >/dev/null
   legacy_sql "DROP SUBSCRIPTION IF EXISTS $REVERSE_SUBSCRIPTION" >/dev/null
   kubectl -n orders delete subscription from-legacy --ignore-not-found --wait=true >/dev/null
   kubectl -n orders delete cluster orders-db --ignore-not-found --wait=true >/dev/null
@@ -44,6 +47,7 @@ check_acked() { # check_acked <side> <label>
   acked pg-writer >"$OUT/acked"
   "${1}_sql" "SELECT seq FROM writes" >"$OUT/present"
   local m n; m=$(missing "$OUT/acked" "$OUT/present"); n=$(wc -l <"$OUT/acked" | tr -d ' ')
+  (( n > 0 )) || fail "$2: the writer has no acknowledged writes at all (see kubectl -n app logs pg-writer)"
   [[ "$m" == 0 ]] || fail "$2: $m of $n acknowledged writes missing on $1"
   pass "$2: all $n acknowledged writes present on $1"
 }

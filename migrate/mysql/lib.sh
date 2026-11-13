@@ -35,7 +35,7 @@ target_sql() {
   kubectl -n "$TARGET_NS" exec -i "$(target_primary)" -c mysqld -- env MYSQL_PWD="$pw" mysql -u moco-admin -NB <<<"$1"
 }
 
-gtid_executed() { "${1}_sql" "SELECT @@GLOBAL.gtid_executed" | tr -d '\n\\'; }
+gtid_executed() { "${1}_sql" "SELECT @@GLOBAL.gtid_executed" | tr -d '[:space:]\\'; }
 
 # wait_gtid <side> <gtid set> [timeout]: until <side> has executed the set.
 wait_gtid() {
