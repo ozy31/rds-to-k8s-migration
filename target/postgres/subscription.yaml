@@ -1,0 +1,21 @@
+# Forward replication legacy -> orders-db. The publication on the legacy side
+# is created by migrate/postgres/10-prepare-source.sh (it is not a CNPG
+# cluster, so it has no Publication resource).
+apiVersion: postgresql.cnpg.io/v1
+kind: Subscription
+metadata:
+  name: from-legacy
+  namespace: orders
+spec:
+  cluster:
+    name: orders-db
+  dbname: orders
+  name: from_legacy
+  publicationName: to_k8s
+  externalClusterName: legacy
+  subscriptionReclaimPolicy: delete
+  parameters:
+    copy_data: "true"
+    # Each table is copied and then caught up independently; binary copy
+    # is faster and the versions match.
+    binary: "true"

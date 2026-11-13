@@ -1,0 +1,37 @@
+# Base backups and WAL go to S3 (SeaweedFS locally), compressed and encrypted
+# at rest by the bucket (SSE on Amazon S3, see docs/eks.md).
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: orders-backups
+  namespace: orders
+spec:
+  retentionPolicy: 14d
+  configuration:
+    destinationPath: s3://pg-backups/orders-db
+    endpointURL: http://seaweedfs.object-store.svc.cluster.local:8333
+    s3Credentials:
+      accessKeyId:
+        name: backup-s3
+        key: ACCESS_KEY_ID
+      secretAccessKey:
+        name: backup-s3
+        key: ACCESS_SECRET_KEY
+    wal:
+      compression: gzip
+    data:
+      compression: gzip
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: orders-db-daily
+  namespace: orders
+spec:
+  schedule: "0 0 2 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: orders-db
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io

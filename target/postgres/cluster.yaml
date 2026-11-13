@@ -1,0 +1,89 @@
+# The target: orders-db on CloudNativePG. Bootstrapped with the schema only
+# (imported from the legacy instance with pg_dump); the data arrives through
+# logical replication, see subscription.yaml.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: orders-db
+  namespace: orders
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-standard-trixie
+  primaryUpdateStrategy: unsupervised
+  storage:
+    size: 2Gi
+  walStorage:
+    size: 1Gi
+  affinity:
+    topologyKey: topology.kubernetes.io/zone
+  certificates:
+    # The application keeps its connection name across the cutover, so the
+    # server certificate must be valid for it (clients use verify-full).
+    serverAltDNSNames:
+      - orders-db.app.svc.cluster.local
+  postgresql:
+    parameters:
+      wal_level: logical
+      max_slot_wal_keep_size: 2GB
+      password_encryption: scram-sha-256
+      # pgaudit: schema and role changes are evidence for the audit.
+      pgaudit.log: ddl,role
+      pgaudit.log_relation: "on"
+      log_connections: "on"
+    pg_hba:
+      # TLS or nothing, for every client.
+      - hostnossl all all 0.0.0.0/0 reject
+      - hostssl all all 0.0.0.0/0 scram-sha-256
+  bootstrap:
+    initdb:
+      database: orders
+      owner: orders_owner
+      import:
+        type: microservice
+        databases: [orders]
+        source:
+          externalCluster: legacy
+        schemaOnly: true
+        postImportApplicationSQL:
+          # Same privilege model as on the legacy instance: the application
+          # role reads and writes, it does not own anything.
+          - CREATE ROLE app LOGIN
+          - CREATE ROLE migrator LOGIN REPLICATION
+          - GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app
+          - GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO app
+          - GRANT SELECT ON ALL TABLES IN SCHEMA public TO migrator
+  managed:
+    roles:
+      # Passwords come from Secrets; CNPG keeps the roles in sync.
+      - name: app
+        ensure: present
+        login: true
+        passwordSecret:
+          name: orders-db-app-user
+      - name: migrator
+        ensure: present
+        login: true
+        replication: true
+        passwordSecret:
+          name: orders-db-migrator-user
+  externalClusters:
+    - name: legacy
+      connectionParameters:
+        host: legacy-pg.legacy.svc.cluster.local
+        user: migrator
+        dbname: orders
+        sslmode: verify-full
+      password:
+        name: legacy-pg-migrator
+        key: password
+      sslRootCert:
+        name: legacy-ca
+        key: ca.crt
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: orders-backups
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 768Mi}
