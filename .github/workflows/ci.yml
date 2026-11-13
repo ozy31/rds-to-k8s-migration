@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: yamllint and shellcheck
+        run: make lint
+
+  postgres:
+    # Real operators on a real cluster: the whole PostgreSQL migration,
+    # including rollback and a point-in-time restore, under write load.
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install kind
+        run: |
+          source versions.env
+          curl -fsSLo "$RUNNER_TEMP/kind" "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo install "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      - name: Cluster, platform, legacy instances
+        run: make cluster platform legacy
+      - name: PostgreSQL migration end to end
+        run: make postgres-test
+      - name: Results
+        if: always()
+        run: cat out/postgres.json || true
+      - name: Dump state on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide
+          kubectl -n orders get cluster,subscription,backup -o wide || true
+          kubectl -n orders describe cluster orders-db || true
+          kubectl -n app logs pg-writer --tail=50 || true

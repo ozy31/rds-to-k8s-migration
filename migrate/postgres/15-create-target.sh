@@ -4,6 +4,7 @@
 # target is deleted and the next attempt archives to a fresh path.
 set -euo pipefail
 cd "$(dirname "$0")"
+# shellcheck source=/dev/null
 source lib.sh
 ATTEMPT=${ATTEMPT:-1}
 

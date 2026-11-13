@@ -5,6 +5,7 @@
 # unfreeze legacy, repoint the application.
 set -euo pipefail
 cd "$(dirname "$0")"
+# shellcheck source=/dev/null
 source lib.sh
 
 [[ $(legacy_sql "SELECT count(*) FROM pg_subscription WHERE subname = '$REVERSE_SUBSCRIPTION'") == 1 ]] \

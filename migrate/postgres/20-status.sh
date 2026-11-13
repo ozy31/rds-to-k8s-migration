@@ -3,6 +3,7 @@
 # target is behind the legacy instance.
 set -euo pipefail
 cd "$(dirname "$0")"
+# shellcheck source=/dev/null
 source lib.sh
 
 target_sql "SELECT format('%-12s %s', srrelid::regclass, CASE srsubstate WHEN 'r' THEN 'ready' WHEN 'd' THEN 'copying' WHEN 's' THEN 'synchronized' ELSE srsubstate::text END) FROM pg_subscription_rel ORDER BY 1"

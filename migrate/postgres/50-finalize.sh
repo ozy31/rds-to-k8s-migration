@@ -5,6 +5,7 @@
 # until it is snapshotted and deleted.
 set -euo pipefail
 cd "$(dirname "$0")"
+# shellcheck source=/dev/null
 source lib.sh
 
 legacy_sql "DROP SUBSCRIPTION IF EXISTS $REVERSE_SUBSCRIPTION" >/dev/null

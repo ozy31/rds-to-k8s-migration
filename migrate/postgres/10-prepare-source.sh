@@ -3,6 +3,7 @@
 # target subscribes to. Safe to run again.
 set -euo pipefail
 cd "$(dirname "$0")"
+# shellcheck source=/dev/null
 source lib.sh
 
 [[ $(legacy_sql "SHOW wal_level") == logical ]] || die "wal_level is not logical (on RDS: rds.logical_replication = 1)"

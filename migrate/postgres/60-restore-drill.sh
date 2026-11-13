@@ -8,6 +8,7 @@
 # object store up to that restore point and must have the same checksums.
 set -euo pipefail
 cd "$(dirname "$0")"
+# shellcheck source=/dev/null
 source lib.sh
 
 RESTORE=${RESTORE:-orders-db-drill}

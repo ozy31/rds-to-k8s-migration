@@ -6,7 +6,9 @@
 # serving the application, or if write downtime exceeds MAX_GAP_MS.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+# shellcheck source=/dev/null
 source tests/e2e/lib.sh
+# shellcheck source=/dev/null
 source migrate/postgres/lib.sh
 MAX_GAP_MS=${MAX_GAP_MS:-15000}
 OUT=${OUT:-out}; mkdir -p "$OUT"

@@ -12,6 +12,7 @@
 # Downtime for writes is steps 2 to 6. Prints a JSON summary on stdout.
 set -euo pipefail
 cd "$(dirname "$0")"
+# shellcheck source=/dev/null
 source lib.sh
 
 MAX_LAG_BYTES=${MAX_LAG_BYTES:-16777216}
