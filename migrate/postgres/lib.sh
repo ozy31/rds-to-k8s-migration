@@ -50,15 +50,16 @@ wait_slot_caught_up() {
   die "slot $slot on $side did not reach $lsn within ${timeout}s"
 }
 
-# checksums <side>: one line per table, "table count md5", in a stable order
-# and a fixed time zone so both sides render rows identically.
-checksums() {
-  local side=$1 t sql=""
+# checksum_sql: one row per application table, "table|count|md5", in a
+# stable order, collation and time zone so both sides render rows the same.
+checksum_sql() {
+  local t sql="SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'; SET extra_float_digits = 1;"
   for t in $(legacy_sql "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY 1"); do
-    sql+="SELECT '$t', count(*), md5(coalesce(string_agg(x::text, '|' ORDER BY x::text COLLATE \"C\"), '')) FROM public.$t x;"
+    sql+=" SELECT '$t', count(*), md5(coalesce(string_agg(x::text, '|' ORDER BY x::text COLLATE \"C\"), '')) FROM public.$t x;"
   done
-  "${side}_sql" "SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'; SET extra_float_digits = 1; $sql"
+  echo "$sql"
 }
+checksums() { "${1}_sql" "$(checksum_sql)"; }
 
 # sequence_setvals <side>: SQL that sets every sequence on the other side to
 # this side's value. Logical replication does not carry sequences.
@@ -71,8 +72,18 @@ sequence_setvals() {
 # every write fails; open sessions are ended so nothing in flight commits
 # afterwards.
 freeze_writes() {
+  local since
+  since=$("${1}_sql" "SELECT clock_timestamp()")
   "${1}_sql" "REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM app;
-              SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = 'app';" >/dev/null
+              SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = 'app' AND backend_start < '$since';" >/dev/null
+  # pg_terminate_backend only sends a signal: a session in the middle of a
+  # commit can still finish it. Wait until every session that started
+  # before the revoke is gone, so the LSN read next covers its commit.
+  for _ in $(seq 1 40); do
+    [[ $("${1}_sql" "SELECT count(*) FROM pg_stat_activity WHERE usename = 'app' AND backend_start < '$since'") == 0 ]] && return 0
+    sleep 0.25
+  done
+  die "application sessions on $1 did not end"
 }
 unfreeze_writes() {
   "${1}_sql" "GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app" >/dev/null
@@ -89,4 +100,29 @@ same_data() {
   a=$(checksums "$1") && b=$(checksums "$2") || return 1
   [[ -n "$a" ]] || return 1
   if [[ "$a" != "$b" ]]; then diff <(echo "$a") <(echo "$b") >&2 || true; return 1; fi
+}
+
+# take_backup <name>: on-demand base backup of the target, waits for it.
+take_backup() {
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: $1
+  namespace: orders
+spec:
+  cluster:
+    name: $TARGET_CLUSTER
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+YAML
+  kubectl -n orders wait "backup/$1" --for=jsonpath='{.status.phase}'=completed --timeout=10m >/dev/null
+}
+
+# latest_backup_id: backup ID of the newest completed backup of the target.
+latest_backup_id() {
+  kubectl -n orders get backup --sort-by=.status.stoppedAt \
+    -o jsonpath='{range .items[?(@.status.phase=="completed")]}{.spec.cluster.name} {.status.backupId}{"\n"}{end}' |
+    awk -v c="$TARGET_CLUSTER" '$1 == c {id = $2} END {print id}'
 }
