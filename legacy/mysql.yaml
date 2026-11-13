@@ -1,0 +1,217 @@
+# "RDS for MySQL": GTID mode, row-based binlog, TLS required, and an admin
+# user with the RDS master user's grants (no SUPER, no clone plugin). The
+# operations RDS exposes as stored procedures (mysql.rds_kill,
+# mysql.rds_set_external_source_with_auto_position, ...) exist here with the
+# same names and arguments, so the migration scripts call exactly what they
+# would call on RDS.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: legacy-mysql-config
+  namespace: legacy
+data:
+  rds.cnf: |
+    [mysqld]
+    server_id = 1001
+    gtid_mode = ON
+    enforce_gtid_consistency = ON
+    binlog_format = ROW
+    binlog_row_image = FULL
+    binlog_expire_logs_seconds = 86400
+    log_replica_updates = ON
+    require_secure_transport = ON
+    ssl_ca = /tls/ca.crt
+    ssl_cert = /tls/tls.crt
+    ssl_key = /tls/tls.key
+    innodb_buffer_pool_size = 128M
+    skip_name_resolve = ON
+  10-users.sh: |
+    #!/usr/bin/env bash
+    # Runs once, as root, on first start.
+    set -euo pipefail
+    mysql -uroot -p"$MYSQL_ROOT_PASSWORD" <<SQL
+    -- The RDS master user's static privileges (no SUPER, no FILE, no SHUTDOWN).
+    CREATE USER 'admin'@'%' IDENTIFIED BY '${ADMIN_PASSWORD}' REQUIRE SSL;
+    GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, REFERENCES, INDEX, ALTER,
+          SHOW DATABASES, CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, REPLICATION SLAVE,
+          REPLICATION CLIENT, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, CREATE USER,
+          EVENT, TRIGGER ON *.* TO 'admin'@'%' WITH GRANT OPTION;
+    CREATE USER 'repl'@'%' IDENTIFIED BY '${REPL_PASSWORD}' REQUIRE SSL;
+    GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';
+    CREATE USER 'app'@'%' IDENTIFIED BY '${APP_PASSWORD}' REQUIRE SSL;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON appointments.* TO 'app'@'%';
+    SQL
+  20-rds-procedures.sql: |
+    -- The subset of the RDS stored procedures the migration uses, with
+    -- their RDS names and signatures. SQL SECURITY DEFINER: they run with
+    -- root's rights, the caller only needs EXECUTE, as on RDS.
+    DELIMITER //
+    CREATE PROCEDURE mysql.rds_kill(IN thread BIGINT)
+    SQL SECURITY DEFINER
+    BEGIN
+      KILL thread;
+    END//
+    CREATE PROCEDURE mysql.rds_set_external_source_with_auto_position(
+      IN host VARCHAR(255), IN port INT, IN user VARCHAR(255), IN password VARCHAR(255),
+      IN ssl_encryption TINYINT, IN delay INT)
+    SQL SECURITY DEFINER
+    BEGIN
+      SET @sql = CONCAT('CHANGE REPLICATION SOURCE TO SOURCE_HOST = ', QUOTE(host),
+        ', SOURCE_PORT = ', port, ', SOURCE_USER = ', QUOTE(user),
+        ', SOURCE_PASSWORD = ', QUOTE(password), ', SOURCE_AUTO_POSITION = 1',
+        ', SOURCE_SSL = ', ssl_encryption, ', SOURCE_DELAY = ', delay,
+        ', GET_SOURCE_PUBLIC_KEY = 1');
+      PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+      SET @sql = NULL;
+    END//
+    CREATE PROCEDURE mysql.rds_set_replication_filter_do_db(IN dbs VARCHAR(1024))
+    SQL SECURITY DEFINER
+    BEGIN
+      -- On RDS this is the replicate-do-db parameter; same effect.
+      SET @sql = CONCAT('CHANGE REPLICATION FILTER REPLICATE_DO_DB = (', dbs, ')');
+      PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+    END//
+    CREATE PROCEDURE mysql.rds_start_replication()
+    SQL SECURITY DEFINER
+    BEGIN
+      START REPLICA;
+    END//
+    CREATE PROCEDURE mysql.rds_stop_replication()
+    SQL SECURITY DEFINER
+    BEGIN
+      STOP REPLICA;
+    END//
+    CREATE PROCEDURE mysql.rds_reset_external_source()
+    SQL SECURITY DEFINER
+    BEGIN
+      STOP REPLICA;
+      RESET REPLICA ALL;
+    END//
+    DELIMITER ;
+    GRANT EXECUTE ON mysql.* TO 'admin'@'%';
+  30-schema.sql: |
+    CREATE DATABASE appointments;
+    USE appointments;
+    CREATE TABLE doctors (
+      id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+      name       VARCHAR(120) NOT NULL,
+      city       VARCHAR(60) NOT NULL,
+      created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+    ) ENGINE = InnoDB;
+    CREATE TABLE appointments (
+      id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+      doctor_id  BIGINT NOT NULL,
+      patient    VARCHAR(120) NOT NULL,
+      starts_at  DATETIME NOT NULL,
+      status     ENUM('booked', 'done', 'cancelled') NOT NULL DEFAULT 'booked',
+      KEY (doctor_id, starts_at),
+      CONSTRAINT fk_doctor FOREIGN KEY (doctor_id) REFERENCES doctors (id)
+    ) ENGINE = InnoDB;
+    CREATE TABLE writes (
+      seq        BIGINT PRIMARY KEY,
+      writer     VARCHAR(32) NOT NULL,
+      written_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+    ) ENGINE = InnoDB;
+    SET SESSION cte_max_recursion_depth = 100000;
+    INSERT INTO doctors (name, city)
+      WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+      SELECT CONCAT('Doctor ', i), ELT(1 + i % 3, 'Istanbul', 'Ankara', 'Izmir') FROM n;
+    INSERT INTO appointments (doctor_id, patient, starts_at, status)
+      WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50000)
+      SELECT 1 + i % 2000, CONCAT('Patient ', i), NOW() - INTERVAL i MINUTE, ELT(1 + i % 3, 'booked', 'done', 'cancelled') FROM n;
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: legacy-mysql
+  namespace: legacy
+spec:
+  serviceName: legacy-mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: legacy-mysql
+  template:
+    metadata:
+      labels:
+        app: legacy-mysql
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mysql
+          image: mysql:8.4.10
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: legacy-mysql-credentials, key: ROOT_PASSWORD}}
+            - name: ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: legacy-mysql-credentials, key: ADMIN_PASSWORD}}
+            - name: REPL_PASSWORD
+              valueFrom: {secretKeyRef: {name: legacy-mysql-credentials, key: REPL_PASSWORD}}
+            - name: APP_PASSWORD
+              valueFrom: {secretKeyRef: {name: legacy-mysql-credentials, key: APP_PASSWORD}}
+          ports:
+            - name: mysql
+              containerPort: 3306
+          readinessProbe:
+            exec:
+              command: [bash, -c, 'mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent']
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: {cpu: 100m, memory: 384Mi}
+            limits: {memory: 768Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/mysql}
+            - {name: run, mountPath: /var/run/mysqld}
+            - {name: config, mountPath: /etc/mysql/conf.d}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d}
+            - {name: tls, mountPath: /tls}
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: legacy-mysql-config
+            items: [{key: rds.cnf, path: rds.cnf}]
+        - name: init
+          configMap:
+            name: legacy-mysql-config
+            defaultMode: 0755
+            items:
+              - {key: 10-users.sh, path: 10-users.sh}
+              - {key: 20-rds-procedures.sql, path: 20-rds-procedures.sql}
+              - {key: 30-schema.sql, path: 30-schema.sql}
+        - name: tls
+          secret:
+            secretName: legacy-mysql-tls
+            defaultMode: 0640
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-mysql
+  namespace: legacy
+spec:
+  selector:
+    app: legacy-mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
