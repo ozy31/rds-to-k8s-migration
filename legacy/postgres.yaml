@@ -1,0 +1,182 @@
+# "RDS for PostgreSQL": a single instance with logical decoding enabled and
+# TLS enforced. See legacy/README.md for how it maps to RDS.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: legacy-pg-config
+  namespace: legacy
+data:
+  pg_hba.conf: |
+    # Unix socket for the image's init scripts only; every network client
+    # must use TLS.
+    local   all             all                                     trust
+    hostssl all             all             0.0.0.0/0               scram-sha-256
+    hostssl replication     migrator        0.0.0.0/0               scram-sha-256
+  10-roles-and-schema.sh: |
+    #!/usr/bin/env bash
+    # Runs once, as the image's superuser, on first start.
+    set -euo pipefail
+    psql -v ON_ERROR_STOP=1 \
+      -v master_pw="$MASTER_PASSWORD" -v migrator_pw="$MIGRATOR_PASSWORD" -v app_pw="$APP_PASSWORD" <<'SQL'
+    -- master is what the RDS master user is: powerful, but not a superuser.
+    CREATE ROLE master LOGIN CREATEROLE CREATEDB REPLICATION PASSWORD :'master_pw';
+    GRANT pg_create_subscription, pg_monitor, pg_signal_backend TO master;
+    CREATE ROLE migrator LOGIN REPLICATION PASSWORD :'migrator_pw';
+    CREATE ROLE app LOGIN PASSWORD :'app_pw';
+    GRANT app TO master WITH ADMIN OPTION;
+    CREATE DATABASE orders OWNER master;
+    SQL
+    psql -v ON_ERROR_STOP=1 -d orders -c "ALTER SCHEMA public OWNER TO master"
+    psql -v ON_ERROR_STOP=1 -d orders -U master -f /docker-entrypoint-initdb.d/schema.sql
+  schema.sql: |
+    -- The application schema, owned by master like on RDS.
+    CREATE TABLE customers (
+      id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      email      text NOT NULL UNIQUE,
+      country    char(2) NOT NULL DEFAULT 'TR',
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE orders (
+      id          bigserial PRIMARY KEY,
+      customer_id bigint NOT NULL REFERENCES customers(id),
+      status      text NOT NULL DEFAULT 'new',
+      amount      numeric(12,2) NOT NULL,
+      created_at  timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX ON orders (customer_id);
+    -- Written by the load generator during the migration; seq is assigned
+    -- by the client so every acknowledged write can be checked afterwards.
+    CREATE TABLE writes (
+      seq        bigint PRIMARY KEY,
+      writer     text NOT NULL,
+      written_at timestamptz NOT NULL DEFAULT clock_timestamp()
+    );
+    INSERT INTO customers (email, country)
+      SELECT 'customer' || g || '@example.com', (ARRAY['TR','TR','TR','DE'])[1 + g % 4]
+      FROM generate_series(1, 5000) g;
+    INSERT INTO orders (customer_id, status, amount, created_at)
+      SELECT 1 + g % 5000, (ARRAY['new','paid','shipped'])[1 + g % 3], (g % 900) + 10.5,
+             now() - make_interval(mins => g)
+      FROM generate_series(1, 50000) g;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app;
+    GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO app;
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO migrator;
+    -- pg_dump reads sequence state even for a schema-only dump.
+    GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO migrator;
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: legacy-pg
+  namespace: legacy
+spec:
+  serviceName: legacy-pg
+  replicas: 1
+  selector:
+    matchLabels:
+      app: legacy-pg
+  template:
+    metadata:
+      labels:
+        app: legacy-pg
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:18.6-trixie
+          args:
+            - -c
+            - wal_level=logical
+            - -c
+            - max_replication_slots=10
+            - -c
+            - max_wal_senders=10
+            - -c
+            - max_logical_replication_workers=8
+            - -c
+            - ssl=on
+            - -c
+            - ssl_cert_file=/tls/tls.crt
+            - -c
+            - ssl_key_file=/tls/tls.key
+            - -c
+            - hba_file=/config/pg_hba.conf
+            - -c
+            - password_encryption=scram-sha-256
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: legacy-pg-credentials, key: POSTGRES_PASSWORD}}
+            - name: MASTER_PASSWORD
+              valueFrom: {secretKeyRef: {name: legacy-pg-credentials, key: MASTER_PASSWORD}}
+            - name: MIGRATOR_PASSWORD
+              valueFrom: {secretKeyRef: {name: legacy-pg-credentials, key: MIGRATOR_PASSWORD}}
+            - name: APP_PASSWORD
+              valueFrom: {secretKeyRef: {name: legacy-pg-credentials, key: APP_PASSWORD}}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, postgres, -h, 127.0.0.1]
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: run, mountPath: /var/run/postgresql}
+            - {name: config, mountPath: /config}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d}
+            - {name: tls, mountPath: /tls}
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: legacy-pg-config
+            items: [{key: pg_hba.conf, path: pg_hba.conf}]
+        - name: init
+          configMap:
+            name: legacy-pg-config
+            defaultMode: 0755
+            items:
+              - {key: 10-roles-and-schema.sh, path: 10-roles-and-schema.sh}
+              - {key: schema.sql, path: schema.sql}
+        - name: tls
+          secret:
+            secretName: legacy-pg-tls
+            # postgres accepts a root-owned key only if it is not world-readable.
+            defaultMode: 0640
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-pg
+  namespace: legacy
+spec:
+  selector:
+    app: legacy-pg
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

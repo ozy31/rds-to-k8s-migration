@@ -1,0 +1,53 @@
+# A private CA for the legacy instances, standing in for the RDS CA bundle.
+# Clients verify the server against it (sslmode=verify-full).
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: selfsigned
+  namespace: legacy
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: legacy-ca
+  namespace: legacy
+spec:
+  isCA: true
+  commonName: legacy-rds-ca
+  secretName: legacy-ca
+  privateKey:
+    algorithm: ECDSA
+  issuerRef:
+    name: selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: legacy-ca
+  namespace: legacy
+spec:
+  ca:
+    secretName: legacy-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: legacy-pg-tls
+  namespace: legacy
+spec:
+  secretName: legacy-pg-tls
+  dnsNames:
+    - legacy-pg
+    - legacy-pg.legacy
+    - legacy-pg.legacy.svc
+    - legacy-pg.legacy.svc.cluster.local
+    # The name the application connects to; it points here until cutover.
+    - orders-db.app.svc.cluster.local
+  privateKey:
+    algorithm: ECDSA
+  issuerRef:
+    name: legacy-ca
+    kind: Issuer
