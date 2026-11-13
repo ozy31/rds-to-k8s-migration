@@ -1,0 +1,171 @@
+# The relay: a plain mysqld we fully control, between RDS and MOCO.
+#
+# MOCO seeds a cluster from an external server with the clone plugin, which
+# RDS does not offer. So the data takes two hops:
+#   RDS --(mysqldump + GTID replication over TLS)--> relay --(clone + GTID replication)--> MOCO
+# GTIDs are preserved end to end, which is what makes catch-up checks,
+# cutover and the reverse (rollback) replication exact.
+# Removed after the migration.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-relay-config
+  namespace: appointments
+data:
+  relay.cnf: |
+    [mysqld]
+    server_id = 2001
+    gtid_mode = ON
+    enforce_gtid_consistency = ON
+    binlog_format = ROW
+    binlog_row_image = FULL
+    log_replica_updates = ON
+    # MOCO uses partial revokes; the clone donor must have it on.
+    partial_revokes = ON
+    plugin_load_add = mysql_clone.so
+    read_only = ON
+    innodb_buffer_pool_size = 128M
+    skip_name_resolve = ON
+    # Replicate only the application schema from RDS (its mysql.* is not
+    # ours to copy).
+    replicate_do_db = appointments
+  10-users.sh: |
+    #!/usr/bin/env bash
+    # Accounts are created with sql_log_bin = 0: they must not get GTIDs of
+    # their own, or RDS could not replicate back from MOCO during a rollback
+    # (those transactions would be missing from every binlog).
+    set -euo pipefail
+    mysql -uroot -p"$MYSQL_ROOT_PASSWORD" <<SQL
+    SET sql_log_bin = 0;
+    -- For MOCO's clone (see the MOCO docs, "replicates data from an external mysqld").
+    CREATE USER 'clone-donor'@'%' IDENTIFIED BY '${CLONE_DONOR_PASSWORD}';
+    GRANT BACKUP_ADMIN, REPLICATION SLAVE ON *.* TO 'clone-donor'@'%';
+    CREATE USER 'clone-init'@'localhost' IDENTIFIED BY '${CLONE_INIT_PASSWORD}';
+    GRANT ALL ON *.* TO 'clone-init'@'localhost' WITH GRANT OPTION;
+    GRANT PROXY ON ''@'' TO 'clone-init'@'localhost' WITH GRANT OPTION;
+    -- Copied into MOCO by the clone: the application keeps its password,
+    -- and RDS logs in with rollback-repl to replicate back.
+    CREATE USER 'app'@'%' IDENTIFIED BY '${APP_PASSWORD}' REQUIRE SSL;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON appointments.* TO 'app'@'%';
+    CREATE USER 'rollback-repl'@'%' IDENTIFIED BY '${ROLLBACK_REPL_PASSWORD}' REQUIRE SSL;
+    GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'rollback-repl'@'%';
+    SQL
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql-relay
+  namespace: appointments
+spec:
+  serviceName: mysql-relay
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-relay
+  template:
+    metadata:
+      labels:
+        app: mysql-relay
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mysql
+          image: mysql:8.4.10
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: mysql-relay-credentials, key: ROOT_PASSWORD}}
+            - name: CLONE_DONOR_PASSWORD
+              valueFrom: {secretKeyRef: {name: mysql-relay-credentials, key: CLONE_DONOR_PASSWORD}}
+            - name: CLONE_INIT_PASSWORD
+              valueFrom: {secretKeyRef: {name: mysql-relay-credentials, key: CLONE_INIT_PASSWORD}}
+            - name: ROLLBACK_REPL_PASSWORD
+              valueFrom: {secretKeyRef: {name: mysql-relay-credentials, key: ROLLBACK_REPL_PASSWORD}}
+            - name: APP_PASSWORD
+              valueFrom: {secretKeyRef: {name: appointments-app-user, key: password}}
+            - name: LEGACY_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: legacy-mysql-admin, key: ADMIN_PASSWORD}}
+            - name: LEGACY_REPL_PASSWORD
+              valueFrom: {secretKeyRef: {name: legacy-mysql-admin, key: REPL_PASSWORD}}
+          ports:
+            - name: mysql
+              containerPort: 3306
+          readinessProbe:
+            exec:
+              command: [bash, -c, 'mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent']
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: {cpu: 100m, memory: 384Mi}
+            limits: {memory: 768Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/mysql}
+            - {name: run, mountPath: /var/run/mysqld}
+            - {name: config, mountPath: /etc/mysql/conf.d}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d}
+            - {name: legacy-ca, mountPath: /legacy-ca}
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: mysql-relay-config
+            items: [{key: relay.cnf, path: relay.cnf}]
+        - name: init
+          configMap:
+            name: mysql-relay-config
+            defaultMode: 0755
+            items: [{key: 10-users.sh, path: 10-users.sh}]
+        - name: legacy-ca
+          secret:
+            secretName: legacy-ca
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-relay
+  namespace: appointments
+spec:
+  selector:
+    app: mysql-relay
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+---
+# MOCO replicates from the relay without TLS (its CHANGE REPLICATION SOURCE
+# has no SSL options), so only the MOCO pods may reach the relay at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mysql-relay
+  namespace: appointments
+spec:
+  podSelector:
+    matchLabels:
+      app: mysql-relay
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/created-by: moco
+              app.kubernetes.io/instance: appointments-db
+      ports:
+        - port: 3306

@@ -6,5 +6,8 @@ bundle=$(kubectl -n legacy get secret legacy-ca -o 'jsonpath={.data.ca\.crt}' | 
 if kubectl -n orders get secret orders-db-ca >/dev/null 2>&1; then
   bundle+=$'\n'$(kubectl -n orders get secret orders-db-ca -o 'jsonpath={.data.ca\.crt}' | base64 -d)
 fi
+if kubectl -n appointments get secret appointments-ca >/dev/null 2>&1; then
+  bundle+=$'\n'$(kubectl -n appointments get secret appointments-ca -o 'jsonpath={.data.ca\.crt}' | base64 -d)
+fi
 kubectl -n app create configmap db-ca-bundle --from-literal=bundle.crt="$bundle" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
