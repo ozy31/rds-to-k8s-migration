@@ -23,7 +23,9 @@ spec:
       command: [bash, -c]
       args:
         - |
-          seq=0
+          # Numbered from the start time, so a restarted writer never
+          # collides with rows from an earlier run.
+          seq=$(( $(date +%s) * 1000 ))
           while true; do
             seq=$((seq + 1))
             if out=$(psql "host=orders-db.app.svc.cluster.local dbname=orders user=app sslmode=verify-full sslrootcert=/ca/bundle.crt connect_timeout=2" \
