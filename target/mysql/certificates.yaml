@@ -1,0 +1,52 @@
+# MOCO would serve MySQL's auto-generated, self-signed certificate. A
+# cert-manager certificate instead lets clients verify the server name
+# (ssl-mode=VERIFY_IDENTITY) before and after the cutover.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: selfsigned
+  namespace: appointments
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: appointments-ca
+  namespace: appointments
+spec:
+  isCA: true
+  commonName: appointments-db-ca
+  secretName: appointments-ca
+  privateKey:
+    algorithm: ECDSA
+  issuerRef:
+    name: selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: appointments-ca
+  namespace: appointments
+spec:
+  ca:
+    secretName: appointments-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: appointments-db-tls
+  namespace: appointments
+spec:
+  secretName: appointments-db-tls
+  dnsNames:
+    - moco-appointments-db-primary.appointments.svc
+    - moco-appointments-db-primary.appointments.svc.cluster.local
+    - moco-appointments-db-replica.appointments.svc.cluster.local
+    - appointments-db.app.svc.cluster.local
+  privateKey:
+    algorithm: ECDSA
+  issuerRef:
+    name: appointments-ca
+    kind: Issuer

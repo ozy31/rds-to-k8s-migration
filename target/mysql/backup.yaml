@@ -1,0 +1,34 @@
+# MOCO backups: a full dump (MySQL Shell) plus the binlogs since the
+# previous backup, to S3. Point-in-time restore needs the backup before the
+# target time and the one after it (which carries the binlogs).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: appointments-db-backup
+  namespace: appointments
+---
+apiVersion: moco.cybozu.com/v1beta2
+kind: BackupPolicy
+metadata:
+  name: appointments-db-backup
+  namespace: appointments
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  jobConfig:
+    serviceAccountName: appointments-db-backup
+    # Locally: the SeaweedFS key. On EKS: IRSA / Pod Identity, no key.
+    envFrom:
+      - secretRef:
+          name: backup-s3-env
+    env:
+      - name: AWS_REGION
+        value: eu-central-1
+    bucketConfig:
+      bucketName: mysql-backups
+      endpointURL: http://seaweedfs.object-store.svc.cluster.local:8333
+      usePathStyle: true
+    workVolume:
+      emptyDir: {}
+    memory: 256Mi
+    maxMemory: 512Mi

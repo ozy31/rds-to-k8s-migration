@@ -1,0 +1,57 @@
+# appointments-db on MOCO: three instances, semi-synchronous replication.
+# While spec.replicationSourceSecretName is set the cluster is an
+# "intermediate primary": it cloned the relay and replicates from it, and is
+# read-only. Cutover removes the field, which makes it writable.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: appointments-db-mycnf
+  namespace: appointments
+data:
+  innodb_buffer_pool_size: 128M
+  # The clone refuses a recipient whose server collation differs from the
+  # donor's. MOCO defaults to utf8mb4_unicode_ci; RDS (and MySQL 8.x) to
+  # utf8mb4_0900_ai_ci. Match the source.
+  character_set_server: utf8mb4
+  collation_server: utf8mb4_0900_ai_ci
+  ssl_ca: /tls/ca.crt
+  ssl_cert: /tls/tls.crt
+  ssl_key: /tls/tls.key
+  # Not require_secure_transport: MOCO's own replication between
+  # instances does not use TLS. The application and rollback accounts are
+  # created REQUIRE SSL instead, which enforces it per account.
+---
+apiVersion: moco.cybozu.com/v1beta2
+kind: MySQLCluster
+metadata:
+  name: appointments-db
+  namespace: appointments
+spec:
+  replicas: 3
+  replicationSourceSecretName: appointments-db-donor
+  mysqlConfigMapName: appointments-db-mycnf
+  backupPolicyName: appointments-db-backup
+  podTemplate:
+    spec:
+      containers:
+        - name: mysqld
+          # Must match the relay's version: MOCO clones from it.
+          image: ghcr.io/cybozu-go/moco/mysql:8.4.10
+          resources:
+            requests: {cpu: 100m, memory: 384Mi}
+            limits: {memory: 768Mi}
+          volumeMounts:
+            - {name: tls, mountPath: /tls, readOnly: true}
+      volumes:
+        - name: tls
+          secret:
+            secretName: appointments-db-tls
+            defaultMode: 0440
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi
