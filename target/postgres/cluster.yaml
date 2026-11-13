@@ -84,6 +84,10 @@ spec:
       isWALArchiver: true
       parameters:
         barmanObjectName: orders-backups
+        # One archive per attempt: an archive must start empty, and a
+        # target rebuilt after a rollback is a new timeline of history.
+        # migrate/postgres/15-create-target.sh sets it.
+        serverName: orders-db-attempt-1
   resources:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {memory: 768Mi}
