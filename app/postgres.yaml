@@ -1,0 +1,14 @@
+# The application's view of the database: one stable name. Until cutover it
+# resolves to the legacy instance; cutover repoints it to the CNPG primary
+# service. On EKS this is a Route 53 record (or an ExternalName like here);
+# either way the application config does not change.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-db
+  namespace: app
+  annotations:
+    migration/target: orders-db-rw.orders.svc.cluster.local
+spec:
+  type: ExternalName
+  externalName: legacy-pg.legacy.svc.cluster.local

@@ -1,0 +1,54 @@
+# Load generator: one transaction per iteration, each on a new connection
+# (like a PHP request), writing a client-numbered row into writes and a new
+# order through the orders id sequence. It logs every result:
+#   ok <seq> <epoch ms>   acknowledged: must exist on whichever side wins
+#   fail <seq> <epoch ms> <error>
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-writer
+  namespace: app
+  labels:
+    app: pg-writer
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 999
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: writer
+      image: postgres:18.6-trixie
+      command: [bash, -c]
+      args:
+        - |
+          seq=0
+          while true; do
+            seq=$((seq + 1))
+            if out=$(psql "host=orders-db.app.svc.cluster.local dbname=orders user=app sslmode=verify-full sslrootcert=/ca/bundle.crt connect_timeout=2" \
+                 -qAtX -v ON_ERROR_STOP=1 \
+                 -c "INSERT INTO writes (seq, writer) VALUES ($seq, 'pg-writer'); INSERT INTO orders (customer_id, amount) VALUES (1 + $seq % 5000, 19.99)" 2>&1); then
+              echo "ok $seq $(date +%s%3N)"
+            else
+              echo "fail $seq $(date +%s%3N) $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
+            fi
+            sleep 0.05
+          done
+      env:
+        - name: PGPASSWORD
+          valueFrom: {secretKeyRef: {name: orders-db-app-user, key: password}}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests: {cpu: 50m, memory: 32Mi}
+        limits: {memory: 128Mi}
+      volumeMounts:
+        - {name: ca, mountPath: /ca}
+  volumes:
+    - name: ca
+      configMap:
+        name: db-ca-bundle
